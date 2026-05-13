@@ -346,17 +346,22 @@ function buildIndexes(data) {
   recommendersByFeed = new Map();
   for (const d of data) {
     byFeedId.set(d.feedId, d);
-    if (d.sourceFeedId) {
-      if (!recommendsByFeed.has(d.sourceFeedId)) recommendsByFeed.set(d.sourceFeedId, []);
-      recommendsByFeed.get(d.sourceFeedId).push(d);
-    }
-    // The dataset now ships a `sources` array with every recommender for this
-    // recommended podcast. Older cached payloads may only have the single
-    // `sourceFeedId` example, so we fall back to that if needed.
-    if (Array.isArray(d.sources) && d.sources.length) {
-      recommendersByFeed.set(d.feedId, d.sources);
-    } else if (d.sourceFeedId) {
-      recommendersByFeed.set(d.feedId, [{ feedId: d.sourceFeedId, url: d.sourceFeedUrl, host: d.recommenderHost }]);
+    // The dataset ships a `sources` array with every recommender for this
+    // recommended podcast. Older cached payloads only have the single
+    // legacy `sourceFeedId` example, so we synthesise the same shape.
+    const sources = Array.isArray(d.sources) && d.sources.length
+      ? d.sources
+      : (d.sourceFeedId
+          ? [{ feedId: d.sourceFeedId, url: d.sourceFeedUrl, host: d.recommenderHost }]
+          : []);
+    // recommendersByFeed: who recommends this podcast (incoming).
+    if (sources.length) recommendersByFeed.set(d.feedId, sources);
+    // recommendsByFeed: stamp this row under every recommender (outgoing).
+    // Previously this used the legacy d.sourceFeedId only, which missed
+    // every recommender that wasn't the dataset's one chosen example.
+    for (const s of sources) {
+      if (!recommendsByFeed.has(s.feedId)) recommendsByFeed.set(s.feedId, []);
+      recommendsByFeed.get(s.feedId).push(d);
     }
   }
 }
