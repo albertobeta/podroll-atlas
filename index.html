@@ -3,13 +3,13 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Podroll Atlas — Podcasts recommending podcasts</title>
+<title>Podroll Atlas · Podcasts recommending podcasts</title>
 <meta name="description" content="Interactive network of all human-curated podcast recommendations, mined from Podcasting 2.0 <podcast:podroll> RSS tags across the Podcast Index. Runs locally in your browser." />
 <link rel="canonical" href="https://atlas.rss.io/" />
 <meta property="og:type" content="website" />
 <meta property="og:url" content="https://atlas.rss.io/" />
 <meta property="og:site_name" content="Podroll Atlas" />
-<meta property="og:title" content="Podroll Atlas — Podcasts recommending podcasts" />
+<meta property="og:title" content="Podroll Atlas · Podcasts recommending podcasts" />
 <meta property="og:description" content="Explore the network of podcasts recommending other podcasts." />
 <meta property="og:image" content="https://atlas.rss.io/ogimage.png" />
 <meta property="og:image:width" content="1200" />
@@ -916,13 +916,62 @@ canvas.addEventListener("mouseleave", () => {
 
 
 // ----- Focus mode --------------------------------------------------------
+const DEFAULT_DOC_TITLE = "Podroll Atlas · Podcasts recommending podcasts";
+const DEFAULT_DOC_DESC = "Interactive network of all human-curated podcast recommendations, mined from Podcasting 2.0 podroll RSS tags across the Podcast Index. Runs locally in your browser.";
+const DEFAULT_OG_IMAGE = "https://atlas.rss.io/ogimage.png";
+const DEFAULT_TWITTER_TITLE = "Podroll Atlas";
+const DEFAULT_TWITTER_DESC = "The network of podcasts recommending other podcasts.";
+
+function setMeta(name, content, attr = "name") {
+  document.querySelector(`meta[${attr}="${name}"]`)?.setAttribute("content", content);
+}
+
+function coverWorks(url) {
+  if (!url) return false;
+  const img = imageCache.get(url);
+  return !!(img && img.complete && img.naturalWidth > 0 && !img.broken);
+}
+
+// Update <title> + description + og + twitter meta tags from a focused
+// podcast record (or null to reset to defaults). The og:image swap only
+// uses the podcast's cover if we already loaded it successfully; otherwise
+// we fall back to the default OG image.
+function updateDocMeta(d) {
+  if (!d) {
+    document.title = DEFAULT_DOC_TITLE;
+    setMeta("description", DEFAULT_DOC_DESC);
+    setMeta("og:title", DEFAULT_DOC_TITLE, "property");
+    setMeta("og:description", DEFAULT_DOC_DESC, "property");
+    setMeta("og:image", DEFAULT_OG_IMAGE, "property");
+    setMeta("twitter:title", DEFAULT_TWITTER_TITLE);
+    setMeta("twitter:description", DEFAULT_TWITTER_DESC);
+    setMeta("twitter:image", DEFAULT_OG_IMAGE);
+    return;
+  }
+  const title = d.title || `Feed #${d.feedId}`;
+  const docTitle = `${title} · Podroll Atlas`;
+  const hostBit = d.recommendedHost ? `, hosted on ${rawHost(d.recommendedHost)}` : "";
+  const desc = `Recommendations via Podroll for ${title}${hostBit}. See what it recommends and who recommends it.`;
+  const image = coverWorks(d.image) ? d.image : DEFAULT_OG_IMAGE;
+  document.title = docTitle;
+  setMeta("description", desc);
+  setMeta("og:title", docTitle, "property");
+  setMeta("og:description", desc, "property");
+  setMeta("og:image", image, "property");
+  setMeta("twitter:title", docTitle);
+  setMeta("twitter:description", desc);
+  setMeta("twitter:image", image);
+}
+
 function focusFeed(feedId) {
   mode = "focus";
   focusFeedId = feedId;
   highlightedId = null;
   const d = byFeedId.get(feedId);
   document.getElementById("focus-banner").style.display = "block";
-  document.getElementById("focus-title").textContent = d ? d.title : `Feed #${feedId}`;
+  const initialTitle = d ? d.title : `Feed #${feedId}`;
+  document.getElementById("focus-title").textContent = initialTitle;
+  updateDocMeta(d || { feedId, title: initialTitle });
   const totalOut = (recommendsByFeed.get(feedId) || []).length;
   const totalIn = (recommendersByFeed.get(feedId) || []).length;
   const noteEl = document.getElementById("focus-note");
@@ -955,6 +1004,7 @@ function exitFocus() {
   if (location.hash) {
     history.replaceState(null, "", location.pathname + location.search);
   }
+  updateDocMeta(null);
   render();
 }
 document.getElementById("exit-focus-btn").addEventListener("click", exitFocus);
@@ -1127,9 +1177,17 @@ function showInfoByFeedId(feedId) {
       if (currentInfoFeedId !== feedId || !enriched) return;
       if (enriched.title) {
         document.getElementById("info-title").textContent = enriched.title;
-        if (focusFeedId === feedId) document.getElementById("focus-title").textContent = enriched.title;
+        d.title = enriched.title;
+        if (focusFeedId === feedId) {
+          document.getElementById("focus-title").textContent = enriched.title;
+        }
       }
-      if (enriched.image) document.getElementById("info-cover").src = enriched.image;
+      if (enriched.image) {
+        document.getElementById("info-cover").src = enriched.image;
+        d.image = enriched.image;
+      }
+      // Refresh page meta with the (now possibly enriched) record.
+      if (focusFeedId === feedId) updateDocMeta(d);
       // Also push the title/cover into the canvas node and any rec-items.
       applyEnrichment(feedId, enriched);
     });
