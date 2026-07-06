@@ -8,19 +8,19 @@ A single static `index.html` (no build step, no backend) running entirely in the
 
 > **Heads up: this is a proof of concept / prototype.** A weekend-style experiment to see what the public Podcast Index podroll dataset looks like as a navigable network. Rough edges, opinionated defaults, and missing polish are expected. Issues and pull requests welcome, but please don't treat it as a finished product.
 >
-> **Desktop only.** The interaction model assumes a mouse and a real keyboard (drag to pan, scroll wheel to zoom, hover to inspect, Esc to exit focus). It will technically open on a phone or tablet but is not optimized for touch input or small screens.
+> **Best on a big screen.** It works on a phone, but the whole point is seeing tens of thousands of podcasts as one network, and that needs pixels. A laptop, desktop or tablet is the recommended way to explore it.
 
 ## What you're looking at
 
-Each dot is a podcast. The bigger the dot, the more times other podcasts in the index recommend it. Color encodes the hosting company (rss.com, Buzzsprout, Megaphone, etc.). Click a podcast to focus on it and see what it recommends (cyan arrows) and who recommends it (pink arrow). Search a title and the camera pans and zooms to the match.
+Each dot is a podcast. The bigger the dot, the more times other podcasts in the index recommend it. Color encodes the hosting company (rss.com, Buzzsprout, Megaphone, etc.). Click a podcast to focus on it and see what it recommends (cyan arrows) and who recommends it (pink arrows). Search a title and the camera pans and zooms to the match.
 
 ## The dataset
 
 Source: [podcastindex.org/datasets](https://podcastindex.org/datasets), specifically the `recommendations.json` file published by the Podcast Index project. The dataset aggregates every `<podcast:podroll>` tag found across the RSS feeds they index and ranks recommended podcasts by mention count.
 
 At the time of writing:
-- ~28,000 recommended podcasts (rows)
-- ~16 MB of JSON
+- ~30,000 podcasts in the network (~23,000 recommended rows, plus podcasts that only appear as recommenders)
+- Over 20 MB of JSON
 - Refreshed periodically on the Podcast Index side
 
 ### About `<podcast:podroll>`
@@ -29,7 +29,7 @@ At the time of writing:
 
 ## Caching
 
-The 16 MB file is fetched once and stored in your browser's **IndexedDB** for 24 hours. Subsequent reloads read straight from the local cache, so:
+The dataset is fetched once and stored in your browser's **IndexedDB** for 24 hours. Subsequent reloads read straight from the local cache, so:
 - You don't hammer the public Podcast Index endpoint.
 - The app opens instantly after the first visit.
 - A "Force refresh" button bypasses the cache when needed.
@@ -40,22 +40,23 @@ The 16 MB file is fetched once and stored in your browser's **IndexedDB** for 24
 
 All rendering, layout, and search happen on your machine. There is no server. Layout and frame rate therefore depend on the hardware running the app. The sidebar shows a live FPS counter so you can see how your machine is doing.
 
-A few of the choices that keep it tractable for 28,000 nodes:
+A few of the choices that keep it tractable for ~30,000 nodes:
 
 - **Canvas, not SVG.** SVG creates one DOM element per node and edge, which collapses past a few thousand. Canvas draws everything to a single bitmap, with browser-managed GPU acceleration where available (and an automatic CPU fallback if not).
 - **Phyllotaxis layout for the global view, not force simulation.** A golden-angle spiral places the most-recommended podcasts near the center and the long tail outward. Instant placement, no per-tick force pass. A short collision-relaxation pass spreads out overlaps. Force simulation is only used inside focus mode where there are a few dozen nodes at most.
 - **Batched edge drawing.** All edges in the global view share a single `beginPath()` / `stroke()` call instead of one per edge.
 - **Viewport culling.** Nodes and edges outside the visible viewport are skipped each frame.
-- **Lazy cover loading.** Cover artwork is only requested and drawn for nodes that render at least 22 pixels wide on screen. Until then they are colored dots. So zooming all the way out costs no image fetches.
+- **Lazy cover loading.** Cover artwork is only requested and drawn for nodes that render at roughly 44 pixels wide or more on screen. Until then they are colored dots. So zooming all the way out costs no image fetches.
 - **Focus cap.** A handful of accounts act as podroll aggregators (one source recommends ~6,000 podcasts). Focus mode renders the top 200 by popularity to keep the canvas responsive. The full list is still shown in the side panel.
+- **Thumbnail covers on small screens.** Podcast covers are commonly 1400 to 3000 px, up to ~36 MB each once decoded, and a popular show's focus page can pull in 150+ of them. That is gigabytes of decoded image memory, which is exactly what gets a tab killed on iOS. On mobile each cover is rasterized once into a small offscreen canvas and the full-resolution original is dropped; the side-panel lists are capped at 50 rows behind a "Show all" button; and deep links skip building the global graph entirely, booting straight into focus mode. Desktop keeps full-resolution art and uncapped lists.
 
 ## D3.js
 
 The app uses [D3](https://d3js.org/) for three things:
 
-1. **`d3-force`** for the focus-mode layout (small graphs, ~10 to 200 nodes).
+1. **`d3-force`** for the focus-mode layout (small graphs, up to ~400 nodes).
 2. **`d3-zoom`** to handle the pan and zoom interaction on the canvas.
-3. **`d3-quadtree`** for click hit-testing across the 28,000-node soup. The quadtree makes "what dot did the user click on?" an `O(log n)` lookup instead of scanning every node.
+3. **`d3-quadtree`** for click hit-testing across the 30,000-node soup. The quadtree makes "what dot did the user click on?" an `O(log n)` lookup instead of scanning every node.
 
 No D3 selection or DOM-binding is used for rendering. The graph is drawn manually to a `<canvas>`. D3 is here for its math and interaction primitives, not its rendering pipeline.
 
@@ -67,9 +68,7 @@ The JSON has one row per *recommended* podcast. Each row carries:
 - A `sources` array listing **every** recommender (`feedId`, `url`, `host`) of that podcast.
 - A legacy `sourceFeedId` / `sourceFeedUrl` / `recommenderHost` triple that mirrors `sources[0]`, kept for backward compatibility.
 
-So if Huberman Lab is recommended 133 times, the row will contain `popularity: 133` and a `sources` array of all 133 recommenders. The Atlas uses that array directly, drawing one real pink incoming arrow per recommender rather than synthetic "phantom" arrows.
-
-> **Heads up about earlier versions.** Before the `sources` array was added, the dataset only stored *one* example recommender per podcast. The Atlas still falls back to phantom incoming arrows for the difference if it encounters an older cached payload (cleared on every 24h refresh, or via the "Force refresh" button). Once you reload against the current dataset, the incoming side becomes fully populated.
+So if Huberman Lab is recommended 133 times, the row will contain `popularity: 133` and a `sources` array of all 133 recommenders. The Atlas uses that array directly, drawing one real pink incoming arrow per recommender.
 
 Practically:
 - **Outgoing arrows are complete.** Every podcast a focused show recommends is in the graph as a node.
@@ -95,16 +94,19 @@ In practice, hosts that tend to cooperate (RSS.com, Buzzsprout, Spreaker, parts 
 
 Open `index.html` in a browser. That is the entire instruction.
 
-The first load downloads ~16 MB from `public.podcastindex.org` and writes it to IndexedDB. Subsequent loads use the cache for 24 hours.
+The first load downloads the 20+ MB dataset from `public.podcastindex.org` and writes it to IndexedDB. Subsequent loads use the cache for 24 hours.
 
-If the remote fetch fails for any reason (CORS, network, the endpoint is down), the app falls back to a local `recommendations.json` next to the HTML file, then to whatever is still in IndexedDB (even if stale). So once you've loaded it once, you can use it offline.
+**Fallback chain.** If the live fetch fails for any reason (network trouble, CORS, the endpoint being down), the app tries `fallback-recommendations.json`: a snapshot of the dataset committed to this repo and deployed with the site, so the Atlas keeps working even when the Podcast Index endpoint is unreachable (the snapshot just ages until the next repo update). If that fails too, it falls back to whatever is still in IndexedDB, even if stale. So once you've loaded it once, you can use it offline.
 
 ## Files
 
 ```
-index.html              The whole app.
-recommendations.json    Optional local copy of the dataset, used as fallback.
-README.md               This file.
+index.html                       The whole app.
+fallback-recommendations.json    Snapshot of the dataset, served if the live endpoint fails.
+404.html                         Real 404 page.
+favicon.svg                      Logo.
+ogimage.png                      Social sharing card.
+README.md                        This file.
 ```
 
 ## License
