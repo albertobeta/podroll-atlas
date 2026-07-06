@@ -1,3 +1,4 @@
 # Dataset dumps and any other JSON snapshots are fetched at runtime
 # from public.podcastindex.org and cached locally — don't commit them.
 *.json
+!fallback-recommendations.json
