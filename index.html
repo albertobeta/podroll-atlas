@@ -159,6 +159,10 @@
     #info {
       top: auto; bottom: 12px; right: 12px; left: 12px;
       width: auto; max-height: 50vh;
+      /* Backdrop blur over a canvas that repaints every sim tick is a
+         per-frame GPU tax on iOS; the background is nearly opaque anyway. */
+      backdrop-filter: none;
+      background: rgba(21,24,33,0.98);
     }
     #hover-title { display: none !important; } /* no hover on touch */
   }
@@ -252,7 +256,7 @@
 "use strict";
 
 const REMOTE_URL = "https://public.podcastindex.org/recommendations.json";
-const LOCAL_FALLBACK = "recommendations.json";
+const LOCAL_FALLBACK = "fallback-recommendations.json"; // snapshot committed to the repo, used if PodcastIndex is unreachable
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const DB_NAME = "podroll-cache";
 const STORE = "data";
@@ -267,6 +271,12 @@ const DEFAULT_COVER = "data:image/svg+xml;utf8," + encodeURIComponent(
 
 const OUT_COLOR = "#22d3ee";
 const IN_COLOR  = "#f472b6";
+
+// Matches the CSS mobile breakpoint, checked once at boot. Phones get the
+// same app but trade fidelity for memory (thumbnail covers, capped lists):
+// iOS kills any tab that grows past roughly 1-1.5GB, and full-res podcast
+// covers alone can blow that budget.
+const IS_MOBILE = window.matchMedia("(max-width: 768px)").matches;
 
 // ----- IndexedDB -------------------------------------------------------
 function openDB() { return new Promise((res, rej) => { const r = indexedDB.open(DB_NAME, 1); r.onupgradeneeded = () => r.result.createObjectStore(STORE); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
@@ -283,6 +293,11 @@ function showLoader() { loader.classList.remove("hidden"); loaderBar.style.width
 async function fetchWithProgress(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  // Cloudflare Pages answers 200 + index.html for ANY missing path (SPA
+  // fallback), so a missing dataset file would otherwise reach JSON.parse
+  // as our own markup. Fail fast so loadData can try the next source.
+  const ct = res.headers.get("content-type") || "";
+  if (ct.includes("text/html")) throw new Error("got HTML, not JSON");
   const total = parseInt(res.headers.get("content-length") || "0", 10);
   if (!res.body || !total) return await res.json();
   const reader = res.body.getReader(); const chunks = []; let got = 0;
@@ -489,23 +504,99 @@ function buildFocusGraph(feedId) {
   return { nodes: [...seen.values()], links, totalOutgoing: allOutgoing.length, totalIncoming: allSources.length };
 }
 
-// ----- Image cache (only used in focus mode) ----------------------------
-const imageCache = new Map(); // url -> HTMLImageElement (loaded)
+// ----- Image cache (used in focus mode and when zoomed in) ---------------
+// Desktop keeps full-resolution Image objects: plenty of memory, crisp art.
+// Mobile must not: podcast covers are commonly 1400-3000px (8-36MB decoded
+// EACH) and iOS kills the whole tab long before a focus page's worth of
+// them fits. So on mobile each cover is fetched a few at a time, rasterized
+// ONCE into a small offscreen canvas, and the full-res Image is dropped;
+// the per-frame drawImage then blits that tiny buffer instead. Taint from
+// non-CORS images propagates to the canvas either way, but we never read
+// pixels back, so it doesn't matter.
+const imageCache = new Map(); // url -> HTMLImageElement (desktop) | { thumb, broken, queued } (mobile)
+const THUMB_PX = 192;                                // ~150KB decoded per cover vs up to 36MB
+const IMG_CACHE_MAX = 2 * FOCUS_MAX_NEIGHBORS + 100; // above the worst-case focus draw set, so live thumbs never thrash
+const MAX_IMG_LOADS = 3;                             // decode a few covers at a time, not 200 at once
+const IMG_LOAD_TIMEOUT_MS = 20000;                   // a stalled host must not pin a loader slot forever
+const imageQueue = [];
+let inflightImages = 0;
+
+function pumpImageQueue() {
+  while (inflightImages < MAX_IMG_LOADS && imageQueue.length) {
+    const url = imageQueue.shift();
+    const entry = imageCache.get(url);
+    if (!entry || entry.thumb || entry.broken) continue;
+    inflightImages++;
+    const img = new Image();
+    img.decoding = "async";
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      inflightImages--;
+      if (ok) {
+        try {
+          const c = document.createElement("canvas");
+          c.width = c.height = THUMB_PX;
+          c.getContext("2d").drawImage(img, 0, 0, THUMB_PX, THUMB_PX);
+          entry.thumb = c; // nothing references img after this; its decode memory goes with it
+        } catch (e) { entry.broken = true; }
+      } else {
+        entry.broken = true;
+      }
+      requestRender();
+      pumpImageQueue();
+    };
+    const timer = setTimeout(() => { img.src = ""; finish(false); }, IMG_LOAD_TIMEOUT_MS);
+    img.src = url;
+    // decode() runs the expensive full-res decode off the main thread, so
+    // thumbnailing doesn't stutter the focus simulation.
+    img.decode().then(() => finish(true), () => finish(false));
+  }
+}
+
+// Forget queued-but-not-started covers (e.g. when focus changes); a cover
+// still on screen simply re-queues on its next drawn frame.
+function clearImageQueue() {
+  for (const url of imageQueue) {
+    const e = imageCache.get(url);
+    if (e) e.queued = false;
+  }
+  imageQueue.length = 0;
+}
+
 function getImage(url) {
   if (!url) return null;
-  const cached = imageCache.get(url);
-  if (cached) {
-    if (cached.broken) return null;
-    return cached.complete && cached.naturalWidth ? cached : null;
+  if (!IS_MOBILE) {
+    const cached = imageCache.get(url);
+    if (cached) {
+      if (cached.broken) return null;
+      return cached.complete && cached.naturalWidth ? cached : null;
+    }
+    const img = new Image();
+    // No crossOrigin: many podcast hosts don't send CORS headers; without crossOrigin
+    // the image still renders to canvas (canvas just becomes "tainted", which we don't care about).
+    img.onload = () => requestRender();
+    img.onerror = () => { img.broken = true; };
+    img.src = url;
+    imageCache.set(url, img);
+    return null;
   }
-  const img = new Image();
-  // No crossOrigin: many podcast hosts don't send CORS headers; without crossOrigin
-  // the image still renders to canvas (canvas just becomes "tainted", which we don't care about).
-  img.onload = () => requestRender();
-  img.onerror = () => { img.broken = true; };
-  img.src = url;
-  imageCache.set(url, img);
-  return null;
+  let entry = imageCache.get(url);
+  if (!entry) {
+    // Evict oldest first (Map preserves insertion order); an evicted cover
+    // that's still on screen just re-queues on the next frame.
+    while (imageCache.size >= IMG_CACHE_MAX) imageCache.delete(imageCache.keys().next().value);
+    entry = { thumb: null, broken: false, queued: false };
+    imageCache.set(url, entry);
+  }
+  if (!entry.thumb && !entry.broken && !entry.queued) {
+    entry.queued = true;
+    imageQueue.push(url);
+    pumpImageQueue();
+  }
+  return entry.broken ? null : entry.thumb;
 }
 
 // ----- Canvas setup -----------------------------------------------------
@@ -751,6 +842,7 @@ function drawPhantomIncoming(focal) {
 async function render() {
   showLoader();
   setLoader("Building graph…", 5);
+  clearImageQueue(); // pending covers belong to the previous view
   await new Promise(r => setTimeout(r, 30));
 
   const built = mode === "focus" ? buildFocusGraph(focusFeedId) : buildGlobalGraph();
@@ -933,8 +1025,9 @@ function setMeta(name, content, attr = "name") {
 
 function coverWorks(url) {
   if (!url) return false;
-  const img = imageCache.get(url);
-  return !!(img && img.complete && img.naturalWidth > 0 && !img.broken);
+  const e = imageCache.get(url);
+  if (!e) return false;
+  return IS_MOBILE ? !!e.thumb : !!(e.complete && e.naturalWidth > 0 && !e.broken);
 }
 
 // Update <title> + description + og + twitter meta tags from a focused
@@ -989,7 +1082,7 @@ function focusFeed(feedId) {
   } else {
     noteEl.style.display = "none";
   }
-  render();
+  render().catch(e => { console.error(e); setLoader("Error: " + e.message); });
   showInfoByFeedId(feedId);
   // Reflect the focused podcast in the URL fragment so it can be shared
   // and deep-linked. replaceState avoids triggering a hashchange event.
@@ -1032,12 +1125,41 @@ window.addEventListener("hashchange", () => {
 // ----- Info panel --------------------------------------------------------
 function renderRecItem(r) {
   return `<div class="rec-item" data-feed="${r.feedId}">
-    <img src="${escapeHTML(r.image || DEFAULT_COVER)}" alt="" data-fallback>
+    <img src="${escapeHTML(r.image || DEFAULT_COVER)}" alt="" data-fallback loading="lazy" decoding="async" width="32" height="32">
     <div class="rec-info">
       <div class="rec-title">${escapeHTML(r.title || `Feed #${r.feedId}`)}</div>
       <div class="rec-pop">${escapeHTML(rawHost(r.recommendedHost) || "")}${r.popularity ? ` · recommended ${r.popularity}×` : ""}</div>
     </div>
   </div>`;
+}
+
+const REC_LIST_CAP = 50; // on phones, only this many rows get real <img> nodes up front
+
+// Fill an info-panel section with a heading + rec-item list. On mobile the
+// list is capped at REC_LIST_CAP rows behind a "Show all N" button: a popular
+// podcast can have 150+ recommenders, and that many eager <img> decodes is
+// exactly the kind of memory burst that gets the tab killed on iOS.
+// rowsFn is called again at expand time so rows reflect any RSS enrichment
+// that completed after the panel first rendered.
+function fillRecList(box, headingHTML, rowsFn) {
+  const rows = rowsFn();
+  const cap = IS_MOBILE ? REC_LIST_CAP : rows.length;
+  box.innerHTML = headingHTML + `<div class="rec-list">${rows.slice(0, cap).map(renderRecItem).join("")}</div>`;
+  if (rows.length > cap) {
+    const btn = document.createElement("button");
+    btn.className = "show-all";
+    btn.textContent = `Show all ${rows.length}`;
+    btn.addEventListener("click", () => {
+      box.querySelector(".rec-list").innerHTML = rowsFn().map(renderRecItem).join("");
+      wireRecItems(box);
+    });
+    box.querySelector(".rec-list").appendChild(btn);
+  }
+  wireRecItems(box);
+}
+function wireRecItems(box) {
+  box.querySelectorAll("img[data-fallback]").forEach(el => { el.onerror = () => { el.onerror = null; el.src = DEFAULT_COVER; }; });
+  box.querySelectorAll(".rec-item").forEach(el => { el.onclick = () => focusFeed(parseInt(el.dataset.feed, 10)); });
 }
 
 const enrichCache = new Map();
@@ -1233,7 +1355,9 @@ function showInfoByFeedId(feedId) {
   const outgoing = recommendsByFeed.get(feedId) || [];
   const outBox = document.getElementById("info-recommends");
   if (outgoing.length) {
-    outBox.innerHTML = `<div class="section-h">→ Recommends ${outgoing.length} podcast${outgoing.length===1?"":"s"}</div><div class="rec-list">${outgoing.map(renderRecItem).join("")}</div>`;
+    fillRecList(outBox,
+      `<div class="section-h">→ Recommends ${outgoing.length} podcast${outgoing.length===1?"":"s"}</div>`,
+      () => recommendsByFeed.get(feedId) || []);
   } else {
     outBox.innerHTML = `<div class="section-h">→ Recommends</div><div style="font-size:12px; color:var(--muted)">No recommendations.</div>`;
   }
@@ -1241,27 +1365,26 @@ function showInfoByFeedId(feedId) {
   const incomingCount = d.popularity || incomingSources.length || 0;
   const inBox = document.getElementById("info-recommenders");
   if (incomingSources.length) {
-    // Build a row for each recommender. If the recommender is also a
-    // recommended podcast in our index we get its title/image/host for free;
-    // otherwise we fall back to the minimal info shipped in the sources array.
-    const recommenderRows = incomingSources.map(s => {
-      const fromIndex = byFeedId.get(s.feedId);
-      return fromIndex || {
-        feedId: s.feedId,
-        title: `Feed #${s.feedId}`,
-        image: null,
-        popularity: 0,
-        recommendedHost: s.host
-      };
-    });
     const missing = Math.max(0, incomingCount - incomingSources.length);
     const caveat = missing > 0
       ? `<div style="font-size:11px; color:var(--muted); margin-bottom:6px; font-style:italic">Showing ${incomingSources.length}; ${missing} more aren't itemized in this version of the dataset.</div>`
       : "";
-    inBox.innerHTML =
-      `<div class="section-h">← Recommended by ${incomingCount} podcast${incomingCount===1?"":"s"}</div>` +
-      caveat +
-      `<div class="rec-list">${recommenderRows.map(renderRecItem).join("")}</div>`;
+    // A row per recommender. If the recommender is also a recommended
+    // podcast in our index we get its title/image/host for free; otherwise
+    // we fall back to the minimal info shipped in the sources array, patched
+    // with anything RSS enrichment already learned.
+    fillRecList(inBox,
+      `<div class="section-h">← Recommended by ${incomingCount} podcast${incomingCount===1?"":"s"}</div>` + caveat,
+      () => incomingSources.map(s => {
+        const fromIndex = byFeedId.get(s.feedId);
+        return fromIndex || applyCachedEnrichment({
+          feedId: s.feedId,
+          title: `Feed #${s.feedId}`,
+          image: null,
+          popularity: 0,
+          recommendedHost: s.host
+        });
+      }));
   } else if (incomingCount > 0) {
     inBox.innerHTML = `<div class="section-h">← Recommended by ${incomingCount} podcast${incomingCount===1?"":"s"}</div><div style="font-size:11px; color:var(--muted); font-style:italic">Dataset doesn't store the recommender list for this one.</div>`;
   } else {
@@ -1269,9 +1392,6 @@ function showInfoByFeedId(feedId) {
   }
   inBox.insertAdjacentHTML("beforeend", `<div class="footer-id">PodcastIndex Feed ID: <strong>${feedId}</strong></div>`);
 
-  document.querySelectorAll("#info img[data-fallback]").forEach(el => { el.onerror = () => { el.onerror = null; el.src = DEFAULT_COVER; }; });
-  outBox.querySelectorAll(".rec-item").forEach(el => el.addEventListener("click", () => focusFeed(parseInt(el.dataset.feed, 10))));
-  inBox.querySelectorAll(".rec-item").forEach(el => el.addEventListener("click", () => focusFeed(parseInt(el.dataset.feed, 10))));
   document.getElementById("info").classList.add("visible");
 }
 function hideInfo() { document.getElementById("info").classList.remove("visible"); currentInfoFeedId = null; }
@@ -1333,10 +1453,14 @@ document.getElementById("refresh-btn").addEventListener("click", async () => {
     resizeCanvas();
     allData = await loadData(false);
     buildIndexes(allData);
-    await render();
-    // Deep-link: if the URL came in with #<feedId>, focus that podcast.
+    // Deep-link: if the URL came in with #<feedId>, go STRAIGHT to focus
+    // mode. Building and drawing the full 29k-node global graph here would
+    // be thrown away by focusFeed() a moment later, and on phones that
+    // wasted work lands exactly on the boot memory peak. The global graph
+    // is built on demand when the user exits focus.
     const initial = parseHashFeedId();
     if (initial !== null) focusFeed(initial);
+    else await render();
   } catch (e) { console.error(e); setLoader("Error: " + e.message); }
 })();
 </script>
